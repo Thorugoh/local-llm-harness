@@ -1,3 +1,6 @@
+const BASE_URL = "http://192.168.1.17:8083";
+const MODEL = "qwen3.6-35b-a3b";
+
 export type Role = "system" | "user" | "assistant" | "tool";
 
 export interface Message {
@@ -31,7 +34,7 @@ export interface ChatResult {
     };
     timing: {
         totalMs: number;
-        ttftMs: number;
+        ttftMs: number | null;
         tokensPerSecond: number | null;
     };
     raw: Message;
@@ -48,3 +51,82 @@ export class LLMError extends Error {
     }
 }
 
+// Non-streaming call
+export async function chat(
+    messages: Message[],
+    options: SamplingOptions = {},
+    timeoutMs = 120_000,
+): Promise<ChatResult> {
+    const started = performance.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response: Response;
+
+    try{
+        response = await fetch(`${BASE_URL}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json"},
+            signal: controller.signal,
+            body: JSON.stringify({
+                model: MODEL,
+                messages,
+                stream: false,
+                temperature: options.temperature ?? DEFAULT_SAMPLING.temperature,
+                max_tokens: options.max_tokens ?? DEFAULT_SAMPLING.max_tokens,
+                top_p: options.top_p,
+                top_k: options.top_k,
+                min_p: options.min_p,
+                repeat_penalty: options.repeat_penalty,
+            }),
+        });
+    } catch (err) {
+        if (err instanceof Error && err.name === "AbortError") {
+            throw new LLMError(`Request timed out after ${timeoutMs}ms`, "timeout", 1);
+        }
+        throw new LLMError(
+            `Could not react the model server at ${BASE_URL}. Is llama server running?`,
+            "connection",
+            2,
+        )
+    } finally {
+        clearTimeout(timer);
+    }
+
+    if(!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new LLMError(
+            `Server returned ${response.status}: ${body.slice(0, 200)}`,
+            "http",
+            response.status,
+        );
+    }
+
+    let data: any;
+    try {
+        data = await response.json();
+    } catch {
+        throw new LLMError("Server returned malformed JSON", "parse", 3);
+    }
+
+    const totalMs = performance.now() - started;
+    const choice = data.choices?.[0];
+    const usage = data.usage ?? {};
+    const completionTokens = usage.completion_tokens ?? 0;
+    
+    return {
+        content: choice?.message?.content ?? "",
+        finishReason: choice?.finish_reason ?? "unknown",
+        usage: {
+        promptTokens: usage.prompt_tokens ?? 0,
+        completionTokens,
+        totalTokens: usage.total_tokens ?? 0,
+        },
+        timing: {
+        totalMs,
+        ttftMs: null, // not measurable without streaming
+        tokensPerSecond: completionTokens > 0 ? completionTokens / (totalMs / 1000) : null,
+        },
+        raw: choice?.message ?? { role: "assistant", content: "" },
+    };
+}
